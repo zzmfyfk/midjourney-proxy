@@ -2,7 +2,7 @@
   "model": {
     "type" : "chatgpt",
     "openai": {
-      "api_key": "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",
+      "api_key": "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",
       "model": "gpt-3.5-turbo",
       "character_desc": "你是ChatGPT, 一个由OpenAI训练的大型语言模型, 你旨在回答并解决人们的任何问题，并且可以使用多种语言与人交流。",
       "conversation_max_tokens": 1000
