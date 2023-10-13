@@ -13,6 +13,8 @@ import com.github.novicezk.midjourney.dto.SubmitImagineDTO;
 import com.github.novicezk.midjourney.dto.SubmitSimpleChangeDTO;
 import com.github.novicezk.midjourney.enums.TaskAction;
 import com.github.novicezk.midjourney.enums.TaskStatus;
+import com.github.novicezk.midjourney.enums.TranslateWay;
+import com.github.novicezk.midjourney.exception.BannedPromptException;
 import com.github.novicezk.midjourney.result.SubmitResultVO;
 import com.github.novicezk.midjourney.service.TaskService;
 import com.github.novicezk.midjourney.service.TaskStoreService;
@@ -22,6 +24,7 @@ import com.github.novicezk.midjourney.support.TaskCondition;
 import com.github.novicezk.midjourney.util.BannedPromptUtils;
 import com.github.novicezk.midjourney.util.ConvertUtils;
 import com.github.novicezk.midjourney.util.MimeTypeUtils;
+import com.github.novicezk.midjourney.util.SnowFlake;
 import com.github.novicezk.midjourney.util.TaskChangeParams;
 import eu.maxschuster.dataurl.DataUrl;
 import eu.maxschuster.dataurl.DataUrlSerializer;
@@ -37,7 +40,10 @@ import org.springframework.web.bind.annotation.RestController;
 import java.net.MalformedURLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Api(tags = "任务提交")
 @RestController
@@ -56,34 +62,30 @@ public class SubmitController {
 		if (CharSequenceUtil.isBlank(prompt)) {
 			return SubmitResultVO.fail(ReturnCode.VALIDATION_ERROR, "prompt不能为空");
 		}
+		prompt = prompt.trim();
 		Task task = newTask(imagineDTO);
 		task.setAction(TaskAction.IMAGINE);
 		task.setPrompt(prompt);
-		String promptEn;
-		int paramStart = prompt.indexOf(" --");
-		if (paramStart > 0) {
-			promptEn = this.translateService.translateToEnglish(prompt.substring(0, paramStart)).trim() + prompt.substring(paramStart);
-		} else {
-			promptEn = this.translateService.translateToEnglish(prompt).trim();
+		String promptEn = translatePrompt(prompt);
+		try {
+			BannedPromptUtils.checkBanned(promptEn);
+		} catch (BannedPromptException e) {
+			return SubmitResultVO.fail(ReturnCode.BANNED_PROMPT, "可能包含敏感词")
+					.setProperty("promptEn", promptEn).setProperty("bannedWord", e.getMessage());
 		}
-		if (CharSequenceUtil.isBlank(promptEn)) {
-			promptEn = prompt;
-		}
-		if (BannedPromptUtils.isBanned(promptEn)) {
-			return SubmitResultVO.fail(ReturnCode.BANNED_PROMPT, "可能包含敏感词");
-		}
-		DataUrl dataUrl = null;
+		List<String> base64Array = Optional.ofNullable(imagineDTO.getBase64Array()).orElse(new ArrayList<>());
 		if (CharSequenceUtil.isNotBlank(imagineDTO.getBase64())) {
-			IDataUrlSerializer serializer = new DataUrlSerializer();
-			try {
-				dataUrl = serializer.unserialize(imagineDTO.getBase64());
-			} catch (MalformedURLException e) {
-				return SubmitResultVO.fail(ReturnCode.VALIDATION_ERROR, "basisImageBase64格式错误");
-			}
+			base64Array.add(imagineDTO.getBase64());
+		}
+		List<DataUrl> dataUrls;
+		try {
+			dataUrls = ConvertUtils.convertBase64Array(base64Array);
+		} catch (MalformedURLException e) {
+			return SubmitResultVO.fail(ReturnCode.VALIDATION_ERROR, "base64格式错误");
 		}
 		task.setPromptEn(promptEn);
-		task.setDescription("/imagine " + imagineDTO.getPrompt());
-		return this.taskService.submitImagine(task, dataUrl);
+		task.setDescription("/imagine " + prompt);
+		return this.taskService.submitImagine(task, dataUrls);
 	}
 
 	@ApiOperation(value = "绘图变化-simple")
@@ -117,12 +119,14 @@ public class SubmitController {
 		} else {
 			description += " " + changeDTO.getAction().name().charAt(0) + changeDTO.getIndex();
 		}
-		TaskCondition condition = new TaskCondition().setDescription(description);
-		Task existTask = this.taskStoreService.findOne(condition);
-		if (existTask != null) {
-			return SubmitResultVO.of(ReturnCode.EXISTED, "任务已存在", existTask.getId())
-					.setProperty("status", existTask.getStatus())
-					.setProperty("imageUrl", existTask.getImageUrl());
+		if (TaskAction.UPSCALE.equals(changeDTO.getAction())) {
+			TaskCondition condition = new TaskCondition().setDescription(description);
+			Task existTask = this.taskStoreService.findOne(condition);
+			if (existTask != null) {
+				return SubmitResultVO.of(ReturnCode.EXISTED, "任务已存在", existTask.getId())
+						.setProperty("status", existTask.getStatus())
+						.setProperty("imageUrl", existTask.getImageUrl());
+			}
 		}
 		Task targetTask = this.taskStoreService.get(changeDTO.getTaskId());
 		if (targetTask == null) {
@@ -131,7 +135,7 @@ public class SubmitController {
 		if (!TaskStatus.SUCCESS.equals(targetTask.getStatus())) {
 			return SubmitResultVO.fail(ReturnCode.VALIDATION_ERROR, "关联任务状态错误");
 		}
-		if (!Set.of(TaskAction.IMAGINE, TaskAction.VARIATION, TaskAction.BLEND).contains(targetTask.getAction())) {
+		if (!Set.of(TaskAction.IMAGINE, TaskAction.VARIATION, TaskAction.REROLL, TaskAction.BLEND).contains(targetTask.getAction())) {
 			return SubmitResultVO.fail(ReturnCode.VALIDATION_ERROR, "关联任务不允许执行变化");
 		}
 		Task task = newTask(changeDTO);
@@ -139,6 +143,8 @@ public class SubmitController {
 		task.setPrompt(targetTask.getPrompt());
 		task.setPromptEn(targetTask.getPromptEn());
 		task.setProperty(Constants.TASK_PROPERTY_FINAL_PROMPT, targetTask.getProperty(Constants.TASK_PROPERTY_FINAL_PROMPT));
+		task.setProperty(Constants.TASK_PROPERTY_PROGRESS_MESSAGE_ID, targetTask.getProperty(Constants.TASK_PROPERTY_MESSAGE_ID));
+		task.setProperty(Constants.TASK_PROPERTY_DISCORD_INSTANCE_ID, targetTask.getProperty(Constants.TASK_PROPERTY_DISCORD_INSTANCE_ID));
 		task.setDescription(description);
 		int messageFlags = targetTask.getPropertyGeneric(Constants.TASK_PROPERTY_FLAGS);
 		String messageId = targetTask.getPropertyGeneric(Constants.TASK_PROPERTY_MESSAGE_ID);
@@ -148,7 +154,7 @@ public class SubmitController {
 		} else if (TaskAction.VARIATION.equals(changeDTO.getAction())) {
 			return this.taskService.submitVariation(task, messageId, messageHash, changeDTO.getIndex(), messageFlags);
 		} else {
-			return SubmitResultVO.fail(ReturnCode.VALIDATION_ERROR, "不支持的操作: " + changeDTO.getAction());
+			return this.taskService.submitReroll(task, messageId, messageHash, messageFlags);
 		}
 	}
 
@@ -200,11 +206,35 @@ public class SubmitController {
 
 	private Task newTask(BaseSubmitDTO base) {
 		Task task = new Task();
-		task.setId(RandomUtil.randomNumbers(16));
+		task.setId(System.currentTimeMillis() + RandomUtil.randomNumbers(3));
 		task.setSubmitTime(System.currentTimeMillis());
 		task.setState(base.getState());
 		String notifyHook = CharSequenceUtil.isBlank(base.getNotifyHook()) ? this.properties.getNotifyHook() : base.getNotifyHook();
 		task.setProperty(Constants.TASK_PROPERTY_NOTIFY_HOOK, notifyHook);
+		task.setProperty(Constants.TASK_PROPERTY_NONCE, SnowFlake.INSTANCE.nextId());
 		return task;
 	}
+
+	private String translatePrompt(String prompt) {
+		if (TranslateWay.NULL.equals(this.properties.getTranslateWay()) || CharSequenceUtil.isBlank(prompt)) {
+			return prompt;
+		}
+		List<String> imageUrls = new ArrayList<>();
+		Matcher imageMatcher = Pattern.compile("https?://[a-z0-9-_:@&?=+,.!/~*'%$]+\\x20+", Pattern.CASE_INSENSITIVE).matcher(prompt);
+		while (imageMatcher.find()) {
+			imageUrls.add(imageMatcher.group(0));
+		}
+		String paramStr = "";
+		Matcher paramMatcher = Pattern.compile("\\x20+-{1,2}[a-z]+.*$", Pattern.CASE_INSENSITIVE).matcher(prompt);
+		if (paramMatcher.find()) {
+			paramStr = paramMatcher.group(0);
+		}
+		String imageStr = CharSequenceUtil.join("", imageUrls);
+		String text = prompt.substring(imageStr.length(), prompt.length() - paramStr.length());
+		if (CharSequenceUtil.isNotBlank(text)) {
+			text = this.translateService.translateToEnglish(text).trim();
+		}
+		return imageStr + text + paramStr;
+	}
+
 }
